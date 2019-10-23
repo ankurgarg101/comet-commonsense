@@ -1,11 +1,11 @@
 """
-Implementation for generating the causal graph where the need/effect of one sentence is directly matched with other sentences
+Computes the causal chains based on the similarity between the need and effect of a predicate pair.
 """
 
 from kutils import *
 from graphviz import Digraph
 
-def create_causal_graph(bert_client, chunk, comet_out, partial_order, use_order):
+def create_causal_graph(bert_client, chunk_predicates, comet_out, use_order):
 
     """
     Create the causal graph using the output from the COMET model
@@ -21,45 +21,57 @@ def create_causal_graph(bert_client, chunk, comet_out, partial_order, use_order)
 
         for rel_name in comet_out[sent_id]:
 
-            for beam_id, beam in enumerate(comet_out[sent_id][rel_name]['beams']):
-                max_sim = 0.0
-                max_sent_id2= None
+            if rel_name == 'Effect':
+                continue
 
+            max_score = 0.0
+            max_sent_id2 = None
+            max_n_beam = None
+            max_cosine_sim = None
+
+
+            for beam_id, beam in enumerate(comet_out[sent_id][rel_name]['beams']):
+
+                beam_score = np.exp(comet_out[sent_id][rel_name]['beam_losses'][beam_id])
                 for sent_id2 in sent_ids:
                     if sent_id2 == sent_id:
                         continue
 
                     if use_order:
-
                         if rel_name == 'xNeed':
-                            if sent_id2 not in partial_order['reverse'][sent_id]:
+                            if sent_id2 > sent_id:
                                 continue
                         elif rel_name == 'Effect':
-                            if sent_id2 not in partial_order['fwd'][sent_id]:
+                            if sent_id2 < sent_id:
                                 continue
 
-                    cosine_sim = comp_bert_sim(bert_client, beam, chunk[sent_id2])
+                    cosine_sim = comp_bert_sim(bert_client, beam, chunk_predicates[sent_id2]['sentence'])
 
                     if cosine_sim < 0.5:
                         continue
 
-                    if max_sim < cosine_sim:
-                        max_sim = cosine_sim
+                    score = cosine_sim * beam_score
+
+                    if max_score < score:
+                        max_score = score
+                        max_cosine_sim = cosine_sim
+                        max_n_beam = beam
                         max_sent_id2 = sent_id2
 
-                if max_sent_id2 is not None:
-                    causal_graph[sent_id].append({
-                            'rel_name': rel_name,
-                            'beam': beam,
-                            'max_sent_id2': max_sent_id2,
-                            'max_sim_score': max_sim
-                        })
+            if max_n_beam is not None:
+                causal_graph[sent_id].append({
+                        'rel_name': rel_name,
+                        'beam': max_n_beam,
+                        'max_sent_id2': max_sent_id2,
+                        'max_score': score,
+                        'max_sim_score': max_cosine_sim
+                    })
 
     #print('===============')
     #print('causal_graph', causal_graph)
     return causal_graph
 
-def create_digraph(causal_graph, text_chunk, fname):
+def create_digraph(causal_graph, chunk_predicates, fname):
 
     """'
     Create a digraph using Graphviz and store it using chunk_id as the filename.
@@ -71,7 +83,7 @@ def create_digraph(causal_graph, text_chunk, fname):
 
     # Create all nodes in the graph
     for sent_id in causal_graph:
-        digraph.node(str(sent_id), '{}. {}'.format(sent_id, text_chunk[sent_id]))
+        digraph.node(str(sent_id), '{}. {}'.format(sent_id, chunk_predicates[sent_id]['sentence']))
 
     # Create the edges by traversing the causal graph
     for sent_id in causal_graph:

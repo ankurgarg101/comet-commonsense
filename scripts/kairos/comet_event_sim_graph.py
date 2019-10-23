@@ -1,21 +1,79 @@
+"""
+Module that first extract predicates from the sentences using Allen NLP OpenIE library and then computes a causal chain on that.
+"""
+
 import argparse
 import numpy as np
 import os
 import simplejson
 import pickle
+import collections
 
 import atomic_predict
 from bert_serving.client import BertClient
 from sentence_transformers import SentenceTransformer
+from allennlp.predictors.predictor import Predictor
 
-def prune_graph(args, comet_model, text_chunk, chunk_id):
+def fetch_openie_events(args, openie_predictor, chunk):
+
+	"""
+	Fetch OpenIE events using AllenNLP library
+	"""
+	predicates = []
+	for sent in chunk:
+		out = openie_predictor.predict(sentence=sent)
+
+		words = out['words']
+		verbs = out['verbs']
+		pred_sent_set = set()
+		for vb in verbs:
+			args = {}
+			for idx, tag in enumerate(vb['tags']):
+				if not tag == 'O':
+					tag_name = tag.split('-')[1]
+					if tag_name not in args:
+						args[tag_name] = words[idx]
+					else:
+						args[tag_name] += ' ' + words[idx]
+
+			sent_objs = []
+			if 'BV(ARG0' in args:
+				sent_objs.append(args['BV(ARG0'])
+			if 'ARG0' in args:
+				sent_objs.append(args['ARG0'])
+			if 'BV' in args:
+				sent_objs.append(args['BV'])
+			if 'V' in args:
+				sent_objs.append(args['V'])
+			if 'ARG1' in args:
+				sent_objs.append(args['ARG1'])
+			if 'AV' in args:
+				sent_objs.append(args['AV'])
+			if 'ARG2' in args:
+				sent_objs.append(args['ARG2'])
+			if 'ARG3' in args:
+				sent_objs.append(args['ARG3'])
+			pred_sent = " ".join(sent_objs)
+
+			if pred_sent not in pred_sent_set:
+				pred_obj = {
+					'sentence': pred_sent,
+					'args': args,
+					'tags': vb['tags'],
+				}
+				predicates.append(pred_obj)
+				pred_sent_set.add(pred_sent)
+
+	return predicates
+
+def prune_graph(args, comet_model, chunk_predicates, chunk_id):
 
 	"""
 	Create the causal graph for a given text chunk
 	@param text_chunk: List of sentences.
 	"""
 
-	folder_name = 'chunk_comet_out_{}'.format(args.sampling_algorithm)
+	folder_name = 'events_comet_out_{}'.format(args.sampling_algorithm)
 	if not os.path.exists(os.path.join(args.data_dir, folder_name)):
 		os.makedirs(os.path.join(args.data_dir, folder_name))
 	elif os.path.exists(os.path.join(args.data_dir, folder_name, '{}.json'.format(chunk_id))):
@@ -25,6 +83,7 @@ def prune_graph(args, comet_model, text_chunk, chunk_id):
 
 	print('Computing Pruned Comet Output Graph')
 
+	text_chunk = [x['sentence'] for x in chunk_predicates]
 	comet_output = atomic_predict.gen_preds(comet_model, text_chunk)
 
 	# Dictionary to store the pruned graph required for computing the
@@ -80,111 +139,58 @@ def prune_graph(args, comet_model, text_chunk, chunk_id):
 
 	return comet_out_pruned
 
-def get_partial_order(args):
-
-	# Process the events and relations and constructs a partial order of sentences in the text chunk
-	partial_order = {}
-
-	graph = {}
-	with open(os.path.join(args.data_dir, 'relations.json'), 'r') as f:
-		relations = simplejson.load(f)
-
-	for rel_type in relations:
-		for rel in relations[rel_type]:
-			if rel['chunk_id'] not in graph:
-				graph[rel['chunk_id']] = {}
-				for i in range(5):
-					graph[rel['chunk_id']][i] = set()
-
-			arg1_sent_idx = rel['arg1_sent_idx'] - rel['chunk_id'] * 5
-			arg2_sent_idx = rel['arg2_sent_idx'] - rel['chunk_id'] * 5
-
-			if not (arg1_sent_idx == arg2_sent_idx):
-				graph[rel['chunk_id']][arg1_sent_idx].add(arg2_sent_idx)
-
-	# Implement the topological sort.
-	for chunk_id in graph:
-		partial_order[chunk_id] = {
-			'fwd': {},
-			'reverse': {}
-		}
-
-		# Compute dfs from each node to get list of all nodes that follow this node
-		for idx in range(5):
-
-			partial_order[chunk_id]['fwd'][idx] = set()
-			partial_order[chunk_id]['reverse'][idx] = set()
-
-			visited = [False for i in range(5)]
-
-			stack = [idx]
-			visited[idx] = True
-
-			while(stack):
-				root = stack.pop()
-				for node in graph[chunk_id][root]:
-					if not visited[node]:
-						partial_order[chunk_id]['fwd'][idx].add(node)
-						stack.append(node)
-						visited[node] = True
-
-		for idx in range(5):
-			for node in partial_order[chunk_id]['fwd'][idx]:
-				partial_order[chunk_id]['reverse'][node].add(idx)
-
-	return partial_order
-
 def main(args):
 
 	args = parser.parse_args()
 	comet_model = atomic_predict.fetch_model(args)
+
 	if args.sim_client == 'bert':
 		bert_client = BertClient()
 	elif args.sim_client == 'sbert':
 		bert_client = SentenceTransformer('bert-base-nli-mean-tokens')
 
+	openie_predictor = Predictor.from_path("https://s3-us-west-2.amazonaws.com/allennlp/models/openie-model.2018-08-20.tar.gz")
+
 	if args.sim_method == 'ne':
-		from need_effect_sim import create_causal_graph, create_digraph
+		from events_ne_sim import create_causal_graph, create_digraph
 	elif args.sim_method == 'sent':
-		from sentence_sim import create_causal_graph, create_digraph
+		from events_sent_sim import create_causal_graph, create_digraph
+
+	# Set the results folder name based on the parameters
+	res_folder = "events_" + args.sim_method + '_' + str(args.use_order) + '_' + args.sim_client
 
 	with open(os.path.join(args.data_dir, 'text_chunks.json'), 'r') as f:
 		text_chunks = simplejson.load(f)
 
-	partial_order = get_partial_order(args)
+	if not os.path.exists(os.path.join(args.data_dir, res_folder, 'causal_graph')):
+		os.makedirs(os.path.join(args.data_dir, res_folder, 'causal_graph'))
 
-	if not os.path.exists(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'causal_graph')):
-		os.makedirs(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'causal_graph'))
-
-	if not os.path.exists(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'comet_out')):
-		os.makedirs(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'comet_out'))
-
-	if not os.path.exists(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'digraphs')):
-		os.makedirs(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'digraphs'))
-
-	with open(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'partial_order.json', ), 'wb') as f:
-		pickle.dump(partial_order, f)
+	if not os.path.exists(os.path.join(args.data_dir, res_folder, 'digraphs')):
+		os.makedirs(os.path.join(args.data_dir, res_folder, 'digraphs'))
 
 	for chunk_id in text_chunks:
 		print("Processing Chunk: ", chunk_id)
 		chunk = text_chunks[chunk_id]
-		comet_out_pruned = prune_graph(args, comet_model, chunk, chunk_id)
-		causal_graph = create_causal_graph(bert_client, chunk, comet_out_pruned, partial_order[int(chunk_id)], args.use_order)
-		create_digraph(causal_graph, chunk, os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'digraphs', str(chunk_id)))
+
+		# Fetch OpenIE events using AllenNLP library
+		chunk_predicates = fetch_openie_events(args, openie_predictor, chunk)
+
+		comet_out_pruned = prune_graph(args, comet_model, chunk_predicates, chunk_id)
+
+		causal_graph = create_causal_graph(bert_client, chunk_predicates, comet_out_pruned, args.use_order)
+
+		create_digraph(causal_graph, chunk_predicates, os.path.join(args.data_dir, res_folder, 'digraphs', str(chunk_id)))
 
 		# Save the causal graph, pruned comet output
-		with open(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'causal_graph', '{}.json'.format(chunk_id)), 'wb') as f:
+		with open(os.path.join(args.data_dir, res_folder, 'causal_graph', '{}.json'.format(chunk_id)), 'wb') as f:
 			pickle.dump(causal_graph, f)
-
-		with open(os.path.join(args.data_dir, '{}_{}'.format(args.sim_method, int(args.use_order)), 'comet_out', '{}.json'.format(chunk_id)), 'wb') as f:
-			pickle.dump(comet_out_pruned, f)
 
 if __name__ == "__main__":
 
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--device", type=str, default="cpu")
 	parser.add_argument("--model_file", type=str, required=True)
-	parser.add_argument("--sampling_algorithm", type=str, default="greedy")
+	parser.add_argument("--sampling_algorithm", type=str, default="beam-10")
 	parser.add_argument('--data_dir', type=str, required=True, default="Directory to read the Dictionary of text chunks from")
 	parser.add_argument('--sim_method', type=str, default='ne', help="The similarity method to compute the causal graph")
 	parser.add_argument('--use_order', type=bool, default=True, help="Whether to use temporal order of sentences or not")
